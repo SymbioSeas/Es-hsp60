@@ -1,0 +1,829 @@
+---
+title: "Escolopes hsp60 Amplicon Analysis"
+author: "Steph Smith"
+date: "5/28/2023"
+output:
+  html_document: default
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{R Load Libraries, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, results="hide"}
+library('dplyr')
+library('dada2')
+library('tidyverse')
+library('shiny')
+library('phyloseq')
+library('Biostrings')
+library('tibble')
+library('hrbrthemes')
+library('microbiomeutilities')
+library('ggplot2')
+library('microViz')
+library('markdown')
+library('microbiome')
+library('ggtext')
+library('patchwork')
+library('ggpubr')
+library('ggrepel')
+library('knitr')
+library('tibble')
+library('decontam')
+library('DESeq2')
+library('dendextend')
+library('vegan')
+library('ggforce')
+library('corncob')
+threads <- 6
+```
+
+```{R Load RData, echo=FALSE, eval=TRUE, cache=TRUE}
+load("Escolopes_hsp60_Amplicon_Analysis.Rdata")
+```
+
+# cpn60 Reference Database
+* From paper: https://www.nature.com/articles/s43705-023-00283-z
+* Github ref: https://github.com/HillLabSask/cpn60-Classifier/releases/tag/v11.1
+* File downloaded to classify in QIIME2: cpn60-q2-feature-classifier-v11.tar.gz
+
+After downloading the cpn60 refdb classifier, I added known input sequences to fasta and taxonomy files and saved as: cpn60_v11.seqs.fasta.
+
+```{bash Train q2-feature-classifier on cpn60 sequences, echo=TRUE, eval=FALSE}
+# Import taxonomy
+qiime tools import --type 'FeatureData[Taxonomy]' --input-format HeaderlessTSVTaxonomyFormat --input-path cpn60_v11_taxonomy_table.txt --output-path cpn60_v11_taxonomy_table.qza
+
+# Import ref seqs
+qiime tools import --type 'FeatureData[Sequence]' --input-path cpn60_v11_seqs.fasta --output-path cpn60_v11_seqs.qza
+
+# Train the classifier
+qiime feature-classifier fit-classifier-naive-bayes --i-reference-reads cpn60_v11_seqs.qza --i-reference-taxonomy cpn60_v11_taxonomy_table.qza --o-classifier cpn60_classifier_v11.qza
+
+# Trained classifier from paper ref'ed above with known input taxa added is saved as: /202310/cpn60_classifier_v11.qza
+```
+
+# Filter and Trim Reads
+* Primers H279/H280 and H1612/H1613 were used at a 1:3 molar ratio
+* Reference for analysis performed: https://sci-hub.hkvisa.net/10.1111/j.1462-2920.2005.00944.x
+* Amplicon length: ~554; only F reads were analyzed here
+
+### Primer Sequences:
+* H279 <- 'GAIIIIGCIGGIGAYGGIACIACIAC'
+* H279.rc <- 'GTNGTNGTNCCNTCNCCNGCNNNNTC'
+* H1612 <- 'GAIIIIGCIGGYGACGGYACSACSAC'
+* H1612.rc <- 'GTNGTNGTNCCGTCNCCNGCNNNNTC'
+* H280 <- 'YKIYKITCICCRAAICCIGGIGCYTT'
+* H280.rc <- 'AANGCNCCNGGNTTNGGNGANNNNNN'
+* H1613 <- 'CGRCGRTCRCCGAAGCCSGGIGCCTT'
+* H1613.rc <- 'AAGGCNCCNGGCTTCGGNGANCGNCG'
+
+```{r Filter and Trim Reads, echo=TRUE, eval=FALSE, cache=TRUE}
+# Load in a list of all F reads (only using F reads for hsp60 samples, this is totally fine)
+fnFs <- sort(list.files('./euprymna_fastq', pattern='_R1_001.fastq', full.names = TRUE))
+# Check file names
+fnFs
+
+# Assign file names for the filtered fastq files
+sample.names <- c("BacMixA", "BacMixB", "ES114A", "ES114B", "EsApoA", "EsApoB", "kitcon", "MB13A", "MB15A", "MB15B", "MB211A", "MB211B", "MB212A", "MB212B", "SymES114A", "SymES114B", "SymES114VentA", "SymES114VentB", "SymWtA", "SymWtB", "SymWtC", "VfMixA", "VfMixB")
+sample.names
+
+euprymna.hsp60.metadata <- read.delim("euprymna_hsp60_metadata.csv", header=TRUE, sep=",")
+
+# Check quality and filter
+plotQualityProfile(fnFs[1:2])
+
+# assign file names for filtered fastq files
+filtFs <- file.path("euprymna_hsp60_filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+names(filtFs) <- sample.names
+
+# trimLeft comes from hsp60 primer length (all = 26 bp)
+out <- filterAndTrim(fwd=fnFs, filt=filtFs,
+                     trimLeft=26,
+                     #truncLen = 274,
+                     maxN=0,
+                     maxEE=2,
+                     compress=TRUE, verbose=TRUE, multithread=TRUE, rm.phix=TRUE)
+head(out)
+
+# make sure a reasonable number of reads were filtered (keep >50k reads/sample-ish)
+
+# Learn the error rates: look at how trimming affects the quality reports
+timestamp()
+errF <- learnErrors(filtFs, multithread=threads)
+saveRDS(errF, file='errF_sampled.rds')
+plotFerr <- plotErrors(errF, nominalQ=T)
+suppressWarnings(print(plotFerr))
+```
+
+# DADA2 Processing
+```{r DADA2 Processing, echo=TRUE, eval=FALSE, cache=TRUE}
+timestamp()
+dadaF <- dada(filtFs, err=errF, multithread=threads, pool=FALSE)
+dadaF[[1]]
+
+# 296 sequence variants were inferred from 39500 input unique sequences
+
+# Here you would typically merge reads, but I'm only using F reads so no merging is necessary
+# Dereplication is done automatically by dada2 when given file names (which I did) so no additional dereplication step is necessary
+
+# Make an ASV table!
+seqtab <- makeSequenceTable(dadaF)
+class(seqtab) # matrix array
+dim(seqtab) # 23 6171
+
+# inspect the distribution of sequence lengths
+table(nchar(getSequences(seqtab))) # 274 6171
+
+# remove chimeras
+seqtab.nochim.es <- removeBimeraDenovo(seqtab, method = "consensus", multithread = threads, verbose = TRUE)
+  # identified 110 bimeras out of 6171 input sequences
+dim(seqtab.nochim.es) # 23 6061
+sum(seqtab.nochim.es)/sum(seqtab) # 0.9692
+```
+
+# Table 1. Read Processing Summary
+```{r Table 1, echo=TRUE, eval=TRUE}
+# track how many reads were lost during each step of processing:
+getN <- function(x) sum(getUniques(x))
+
+summary_tab <- data.frame(row.names=sample.names, 
+                          "DADA2 Input"=out[,1],
+                          "Filtered"=out[,2], 
+                          "Denoised"=sapply(dadaF, getN),
+                          "Final Read Count"=rowSums(seqtab.nochim.es),
+                          "Percent Reads Retained"=round(rowSums(seqtab.nochim.es)/out[,1]*100, 1))
+
+# save summary table as a file
+write.table(summary_tab, "euprymna_hsp60_reads_tracked.tsv", quote=FALSE, sep="\t", col.names = NA)
+
+# write unique seqs to a .fasta file to import into qiime2
+uniquesToFasta(seqtab.nochim.es, fout='euprymna-hsp60-repseqs.fasta', ids=colnames(seqtab.nochim.es))
+
+# write ASV table (seqtab.nochim) to a .txt file to import into QIIME2
+write.table(t(seqtab.nochim.es), "euprymna-hsp60-seqtab.txt", sep="\t", row.names=TRUE, col.names=NA, quote=FALSE)
+
+# assign taxonomy in QIIME2 using the pretrained classifier created on 3/29/2023
+```
+
+```{r Read Summary Table, echo=FALSE, eval=TRUE, message=FALSE, cache=TRUE}
+library(gtsummary)
+library(gt)
+library(gtExtras)
+
+table1 <- gt(summary_tab,
+             rownames_to_stub=TRUE
+             ) %>%
+  tab_header(
+    title = "Table 1. Read Processing Summary.",
+    subtitle = "Number of total reads per sample retained at each major read processing step."
+  ) %>%
+  gt_theme_pff()
+
+table1
+```
+
+# Assign Taxonomy Using QIIME2
+```{bash Assign Taxonomy Using QIIME2, echo=TRUE, eval=FALSE}
+qiime tools import --type 'FeatureData[Sequence]' --input-path euprymna-hsp60-repseqs.fasta --output-path euprymna-hsp60-repseqs.qza
+
+qiime feature-classifier classify-hybrid-vsearch-sklearn \
+--i-query euprymna-hsp60-repseqs.qza \
+--i-reference-reads cpn60_v11_seqs.qza \
+--i-reference-taxonomy cpn60_v11_taxonomy_table.qza \
+--i-classifier cpn60_classifier_v11.qza \
+--p-no-prefilter \
+--p-maxaccepts all \
+--p-maxrejects all \
+--p-confidence 0.6 \
+--o-classification euprymna_hsp60_classified
+
+qiime tools export \
+--input-path euprymna_hsp60_classified.qza \
+--output-path euprymna_hsp60_classified
+
+# add a special header for BIOM in the feature-table:
+echo -n "#OTU Table" | cat - euprymna-hsp60-seqtab.txt > euprymna-hsp60-biom-table.txt
+
+# convert to BIOM v2.1:
+biom convert -i euprymna-hsp60-biom-table.txt -o euprymna-hsp60.biom --table-type="OTU table" --to-hdf5
+
+# open taxonomy tsv and change headers to "#OTUID taxonomy  confidence", and save a copy as taxonomy.txt
+
+# now updated table.biom file with that biom-taxonomy info:
+biom add-metadata -i euprymna-hsp60.biom -o euprymna-hsp60-wtax.biom --observation-metadata-fp taxonomy.txt --sc-separated taxonomy
+
+# then go import the biom-with-taxonomy in R
+```
+
+# Import BIOM into Phyloseq
+```{r Create Phyloseq Object, echo=TRUE, eval=FALSE, cache=TRUE}
+asv.seqs <- colnames(seqtab.nochim.es)
+asv.headers <- vector(dim(seqtab.nochim.es)[2], mode="character")
+
+for (i in 1:dim(seqtab.nochim.es)[2]) {
+  asv.headers[i] <- paste(">ASV", i, sep="")
+}
+
+# write out a FASTA of final ASV seqs:
+asv.fasta <- c(rbind(asv.headers, asv.seqs))
+write(asv.fasta, "euprymna-hsp60-ASVs.fasta")
+
+# write out a count table with ASV-IDs instead of ASV-sequences as names:
+asv.tab <- t(seqtab.nochim.es)
+row.names(asv.tab) <- sub(">", "", asv.headers)
+write.table(asv.tab, "euprymna-hsp60-ASVcounts.tsv", sep="\t", quote=F, col.names=NA)
+
+# import euprymna-hsp60 biom as phyloseq object
+es.hsp <- import_biom("euprymna-hsp60-wtax.biom")
+taxa_names(es.hsp) <- rownames(asv.tab)
+tax_table(es.hsp)[1:5]
+otu_table(es.hsp)[1:5]
+
+# rename columns in seqtab.nochim.es with sample name (from filt file name)
+rownames <- rownames(seqtab.nochim.es)
+
+#use sub() to rename row names
+new.rownames <- sub("_.*$", "", rownames)
+
+#print the new row names
+print(new.rownames)
+
+sample_names(es.hsp) <- new.rownames
+rownames(seqtab.nochim.es) <- new.rownames
+sample_data(es.hsp) <- es.hsp.meta
+sample_variables(es.hsp)
+
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species")
+colnames(tax_table(es.hsp))
+colnames(tax_table(es.hsp)) <- ranks
+tax_table(es.hsp)[1:5]
+
+#format to best hit, do this before you assign "unclassified" labeling!
+es.hsp <- format_to_besthit(es.hsp)
+view(tax_table(es.hsp))
+```
+
+# Contamination Analysis
+Run R::decontam to identify contaminating sequencing based on frequency and prevalence in negative extraction control samples. These ASVs are then pruned from the dataset.
+
+* 12 ASVs were removed via R::decontam analysis.
+
+```{R Contamination Analysis, echo=TRUE, eval=FALSE, cache=TRUE}
+# identify contaminants based on frequency
+contamdf.freq.es.hsp <- isContaminant(es.hsp, method="frequency", conc="dnaquant")
+head(contamdf.freq.es.hsp)
+table(contamdf.freq.es.hsp$contaminant) # identified 21 contaminants
+head(which(contamdf.freq.es.hsp$contaminant))
+# 5, 8, 86, 107, 176, 290
+
+# identify contaminants based on prevalence in negative control
+sample_data(es.hsp)$is.neg <- sample_data(es.hsp)$sample.type == "kitcon"
+contamdf.prev.es.hsp <- isContaminant(es.hsp, method="prevalence", neg="is.neg")
+table(contamdf.prev.es.hsp$contaminant) # identified 7 contaminants
+head(which(contamdf.prev.es.hsp$contaminant))
+# 53, 57, 141, 180, 268, 1574
+x <- which(contamdf.prev.es.hsp$contaminant)
+y <- which(contamdf.freq.es.hsp$contaminant)
+
+# prune contaminant ASVs identified by decontam
+contam.asvs.es.hsp <- c(x,y)
+contam.asvs.es.hsp
+contam.asvs.es.hsp[1:28]=paste0("ASV", contam.asvs.es.hsp[1:28])
+contam.asvs.es.hsp
+
+pop.taxa = function(es.hsp, contam.asvs.es.hsp){
+  allTaxa = taxa_names(es.hsp)
+  allTaxa <- allTaxa[!(allTaxa %in% contam.asvs.es.hsp)]
+  return(prune_taxa(allTaxa, es.hsp))
+}
+es.hsp = pop.taxa(es.hsp, contam.asvs.es.hsp)
+es.hsp # 6033 taxa and 23 samples
+
+# add reads per sample to phyloseq object metadata
+sample_data(es.hsp)$reads.sample <- readcount(es.hsp)
+sample_data(es.hsp)
+```
+
+# Prep Data for Visualization
+## Sample Metadata
+```{r Update Sample Metadata, echo=TRUE, eval=FALSE, cache=TRUE}
+euprymna.hsp60.metadata <- read.csv("es-hsp metadata.csv")
+euprymna.hsp60.metadata <- column_to_rownames(euprymna.hsp60.metadata, var="X")
+sample_data(es.hsp) <- euprymna.hsp60.metadata
+sample_data(es.hsp)
+```
+
+## Format to Best Hit
+```{r Format to Best Hit, echo=TRUE, eval=FALSE, cache=TRUE}
+es.hsp <- format_to_besthit(es.hsp)
+```
+
+## Rename Taxa
+```{r Rename Taxa, echo=TRUE, eval=FALSE, cache=TRUE}
+es.hsp.tx <- as.data.frame(tax_table(es.hsp))
+colnames(es.hsp.tx) = c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species", "best_hit")
+head(es.hsp.tx)
+head(tax_table(es.hsp))
+
+es.hsp.tx$Family[es.hsp.tx$Phylum == "k__Bacteria"] <- "Unidentified Bacteria"
+es.hsp.tx$Family[es.hsp.tx$Domain == "Unassigned"] <- "Unassigned at Kingdom Level"
+unique(es.hsp.tx$Family)
+
+es.hsp.tx <- as.matrix(es.hsp.tx)
+tax_table(es.hsp) <- es.hsp.tx
+tax_table(es.hsp)[1:5,1:5]
+```
+
+# Figure 1. Observed Culture
+
+## Define Figure 1 Sample Order
+```{r Define Fig 1 Sample Order, echo=TRUE, eval=FALSE, cache=TRUE}
+phyloseq::sample_names(es.hsp)
+es.sample.order <- c("kitcon", "ES114A", "ES114B", "VfMixA", "VfMixB", "BacMixA", "BacMixB", "EsApoA", "EsApoB", "SymES114VentA", "SymES114VentB", "SymES114A", "SymES114B", "SymWtA", "SymWtB", "SymWtC", "MB13A", "MB15A", "MB15B", "MB211A", "MB211B", "MB212A", "MB212B")
+```
+
+## Create Figure 1 Palette
+```{r Create Input TaxPalette, echo=TRUE, eval=TRUE, cache=TRUE}
+figure2_pal <- c("Aliivibrio fischeri ES114" = "#734f5a",
+           "Aliivibrio fischeri MB13B1" = "#264653",
+           "Aliivibrio fischeri MB13B2" = "#2a9d8f",
+           "Rossellomorea aquimaris TF-12" = "#f4a261",
+           "Pseudoalteromonas luteoviolacea HI1" = "#e76f51",
+           "Vibrio litoralis DSM17657" = "#941c2f",
+           "Other Species" = "#d5bdaf")
+tax_palette_plot(figure2_pal)
+```
+
+## Culture Samples
+```{r Culture Samples, echo=TRUE, eval=FALSE, cache=TRUE}
+# Subset only Bacterial Culture samples
+es.hsp.culture <- es.hsp %>%
+  subset_samples(sample.type == "bacterial culture")
+
+# Extract ASV data (abundance counts)
+culture.asv.data <- otu_table(es.hsp.culture)
+
+# Extract taxonomy data
+culture.tax.data <- tax_table(es.hsp.culture)
+
+# Convert ASV data to data frame and filter
+df.culture.asv <- as.data.frame(culture.asv.data)
+# Sum the counts for each ASV and filter out those with zero counts across all samples
+asv_sums <- rowSums(df.culture.asv)
+df.culture.asv <- df.culture.asv[asv_sums > 0, ]
+
+# Make sure to filter the taxonomy data to match the filtered ASV data
+df.culture.tax <- as.data.frame(culture.tax.data)
+df.culture.tax <- df.culture.tax[asv_sums > 0, ]
+
+# Convert back to otu_table and tax_table
+filtered_culture.asv.data <- otu_table(as.matrix(df.culture.asv), taxa_are_rows = TRUE)
+filtered_culture.tax.data <- tax_table(as.matrix(df.culture.tax))
+
+# Recreate the phyloseq object with the filtered data
+es.hsp.culture.filtered <- phyloseq(filtered_culture.asv.data, filtered_culture.tax.data, sample_data(es.hsp.culture))
+
+# Check the result
+print(es.hsp.culture.filtered)
+```
+
+## Plot Culture Samples
+```{r Plot Culture Samples, echo=TRUE, eval=FALSE, cache=TRUE}
+# Subset culture samples
+sample_data(es.hsp.culture)$treatment <- factor(sample_data(es.hsp.culture)$treatment, levels = c("ES114 culture", "mixed V. fischeri culture", "mixed bacteria culture"))
+
+panel_1 <- es.hsp.culture %>%
+  tax_transform("compositional", chain=TRUE)
+
+panel_1 <- comp_barplot(panel_1,
+                         "Species",
+                         n_taxa = 6,
+                         tax_order=c("Aliivibrio fischeri ES114", 
+                                     "Aliivibrio fischeri MB13B1", 
+                                     "Aliivibrio fischeri MB13B2", 
+                                     "Rossellomorea aquimaris TF-12", 
+                                     "Pseudoalteromonas luteoviolacea HI1", 
+                                     "Vibrio litoralis DSM17657"),
+                         merge_other=FALSE,
+                         bar_width = 0.975,
+                         other_name = "Other Species",
+                         palette = figure2_pal
+                         ) +
+  facet_col(~ treatment, scales="free_y") +
+  labs(y = "Relative Abundance",
+       title = "Observed Strains",
+       fill = "Input Strains") +
+  scale_y_percent(limits = c(0, 1.05)) +
+  theme_biome_utils() +
+  theme(legend.text = element_text(face = "italic", size = 8),
+        axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.y = element_text(size = 9),
+        axis.title.x = element_text(size = 9),
+        strip.text = element_text(hjust = 0.5, face = "bold"),
+        plot.title = element_text(size = 10, hjust = 0, face = "bold"),
+        legend.title = element_text(size = 10),
+        legend.position = "left",
+        strip.background = element_blank(),
+        panel.border = element_blank(),
+        legend.key.width = unit(0.3, "cm"), 
+        legend.key.height = unit(0.3, "cm")) +
+        #legend.box.margin = margin(0, 2, 0, 0, "cm")) +
+  coord_flip()
+```
+
+## Figure 1A
+```{r Figure 1A, echo=FALSE, eval=TRUE, cache=TRUE, fig.dim=c(8,8)}
+plot(panel_1 + 
+  plot_layout(heights = c(2, 2, 2), ncol = 1)
+)
+```
+
+## Save Culture Samples Plot
+```{r Save Culture Samples Plot, echo=TRUE, eval=FALSE}
+pdf("panel_1v2.pdf", width=7, height=7)
+panel_1 + 
+  plot_layout(heights = c(2, 2, 2), ncol = 1) + 
+  theme(plot.margin = unit(c(1, 1, 0, 1), "cm"))  # Top, Right, Bottom, Left
+dev.off()
+```
+
+# Figure 1. Hsp60 Tree
+- Downloaded annotated RefSeq genome assemblies from NCBI for 72 *V. fischeri* strains.
+- Extracted the *hsp60* gene sequence from each genome into a multi-fasta file: hsp60_ncbi_vf.fasta
+- Performed fastANI pairwise comparisons to calculate whole-genome average nucleotide identity (% ANI) between whole genomes
+
+## *hsp60* Multiple Sequence Alignment
+```{r NCBI MSA, echo=TRUE, eval=FALSE, cache=TRUE}
+library(msa)
+library(ggtree)
+library(phangorn)
+library(ggtree)
+library(ape)
+
+vfhsp60 <- readDNAStringSet("hsp60_ncbi_vf.fasta")
+names(vfhsp60) <- make.unique(names(vfhsp60))
+
+# Perform multiple sequence alignment using ClustalW (you can choose other tools like ClustalOmega or MUSCLE)
+alignment <- msa(vfhsp60, method = "ClustalW")
+
+# Convert the alignment to a DNAStringSet object
+aligned_seqs <- as(alignment, "DNAStringSet")
+
+# Convert the DNAStringSet to a matrix suitable for phylogenetic analysis
+alignment_matrix <- as.matrix(aligned_seqs)
+
+# Convert the alignment matrix to a phyDat object
+alignment_phyDat <- phyDat(alignment_matrix, type = "DNA")
+
+# Create a distance matrix
+dist_matrix <- dist.ml(alignment_phyDat)
+```
+
+## *hsp60* Neighbor-Joining Tree
+```{r NCBI Neighbor-Joining Tree, echo=TRUE, eval=FALSE, cache=TRUE}
+library(ggtree)
+library(tidytree)
+
+# Perform neighbor joining to create a tree
+tree_nj <- NJ(dist_matrix)
+
+# Ensure the tip labels of the tree match the sequence names
+tree_nj$tip.label <- names(vfhsp60)
+
+# Perform maximum likelihood estimation to refine the tree
+fit <- pml(tree_nj, data = alignment_phyDat)
+fit <- optim.pml(fit, model = "GTR", optGamma = TRUE)
+
+# If rooting the tree, identify the label for V.logei
+#v_logei_label <- "V.logei"  # Adjust this to match the exact label used in your sequences
+
+# Root the tree using V.logei as the outgroup
+#rooted_tree <- root(fit$tree, outgroup = v_logei_label, resolve.root = TRUE)
+
+#ladderized_tree <- ladderize(rooted_tree)
+ladderized_tree <- ladderize(fit$tree)
+
+# Plot tree
+tree <- fit$tree %>%
+  ggtree(tree,
+         ladderize = TRUE,
+         size = 0.5,
+         layout = "roundrect"
+         ) + 
+  geom_tiplab(align = FALSE,
+              size = 5.5,
+              hjust = -.15) +
+  geom_treescale() +
+  theme(legend.position = "bottom")
+
+# Print the panel
+print(tree)
+```
+
+## Figure 1B
+```{r Figure 1B, echo=FALSE, eval=TRUE, cache=TRUE, fig.dim=c(10,12)}
+plot(tree)
+```
+
+## Save *hsp60* Tree Plot
+```{r Save NCBI Tree, echo=TRUE, eval=FALSE}
+pdf("tree.pdf", height = 15, width = 5)
+tree
+dev.off()
+```
+
+# Figure 2. *Vibrio fischeri* Abundance in Squid Samples
+- Rename taxa in the phyloseq object without the strain name (genus/species only) so that all *V. fischeri* is plotted together.
+
+## Rename Taxa Without Strain Names
+```{r Rename Taxa Without Strain Name, echo=TRUE, eval=FALSE, cache=TRUE}
+# add phytree to es.hsp
+random_tree = rtree(ntaxa(es.hsp), rooted=TRUE, tip.label=taxa_names(es.hsp))
+phy_tree(es.hsp) <- random_tree
+
+# Look at current naming scheme
+head(tax_table(es.hsp)[, "Species"])
+
+# Function to remove strain names from taxa names
+remove_strain_names <- function(taxa_name) {
+  # Use gsub to remove anything after the second part of the name
+  gsub("(\\w+\\s\\w+).*", "\\1", taxa_name)
+}
+
+# Duplicate es.hsp phyloseq object
+es.hsp.2 <- es.hsp
+
+# Apply the function to all taxa names in the phyloseq object
+tax_table(es.hsp.2) <- apply(tax_table(es.hsp.2), 2, function(x) remove_strain_names(x))
+
+# Example to check if it worked (assuming tax_table has "Species" as a column)
+head(tax_table(es.hsp.2)[, "Species"])
+```
+
+## Calculate Percent *V. fischeri* Abundance in Squid
+```{r Percent Vf, echo=TRUE, eval=FALSE, cache=TRUE}
+# Extract the OTU and taxonomy tables
+otu_data <- otu_table(es.hsp.2)
+tax_data <- tax_table(es.hsp.2)
+
+# Identify which taxa belong to "Aliivibrio fischeri"
+fischeri_indices <- which(tax_data[, "Species"] == "Aliivibrio fischeri")
+
+# Calulate the total abundance for each sample
+total_abundance <- colSums(otu_data)
+
+# Calculate the abundance of "fischeri" in each sample
+fischeri_abundance <- colSums(otu_data[fischeri_indices, ])
+
+# Calculate as a percentage
+fischeri_percentage <- (fischeri_abundance / total_abundance) * 100
+
+# Access the sample_data of the phyloseq object
+es.hsp.meta <- sample_data(es.hsp.2)
+
+# Add the fischeri_percentage as a new column
+es.hsp.meta$fischeri_percentage <- fischeri_percentage
+
+# Replace the sample_data in the phyloseq object with the modified sample_data
+sample_data(es.hsp.2) <- es.hsp.meta
+head(sample_data(es.hsp.2))
+
+# Extract the fischeri_percentage from the sample_data
+fischeri_percent_data <- sample_data(es.hsp.2)$fischeri_percentage
+
+# Create a new label in the es.hsp sample data that concatonates the sample name and the fischeri percentage (rather than trying to put the vibrio percentage on a different axis, much more complicated)
+new_labels <- paste(sample_names(es.hsp.2), sprintf(" (%.2f%%)", fischeri_percent_data))
+
+sample_data(es.hsp.2)$FischeriLabel <- paste(sample_data(es.hsp.2)$SAMPLE, new_labels)
+```
+
+## Define Figure 2A Sample Order
+```{r Define Fig 2 Sample Order, echo=TRUE, eval=FALSE, cache=TRUE}
+phyloseq::sample_names(es.hsp.2)
+panel_1b.1_order <- c("EsApoB", "EsApoA", "SymWtC", "SymWtB", "SymWtA", "SymES114B", "SymES114A", "SymES114VentB", "SymES114VentA", "MB212B", "MB212A", "MB211B", "MB211A", "MB15B", "MB15A", "MB13A")
+```
+
+## Create Figure 2A Palette
+```{r Create Figure 2 TaxPalette, echo=TRUE, eval=TRUE, cache=TRUE}
+panel_1b.2_pal <- c("Aliivibrio fischeri" = "#104911",
+                    "Vibrio (Genus)" = "lightblue",
+                    "Other Taxa" = "#d5bdaf")
+tax_palette_plot(panel_1b.2_pal)
+```
+
+## Plot *V. fischeri* Relative Abundance
+```{r Plot Vf Relative Abundance, echo=TRUE, eval=FALSE, cache=TRUE}
+# Use es.hsp.2 for species-level taxa
+es.hsp_filtered <- subset_samples(es.hsp.2, sample.type %in% c("juvenile squid", "juvenile squid ventate", "adult squid"))
+
+# Perform the compositional transformation
+es.hsp_filtered <- es.hsp_filtered %>%
+  tax_transform("compositional", chain = TRUE)
+
+# Ensure the tax_table is in the correct format and modify it to label all species within the "Vibrio" genus
+tax_table_temp <- as.data.frame(tax_table(es.hsp_filtered))
+tax_table_temp$Species <- ifelse(tax_table_temp$Genus == "Vibrio", "Vibrio (Genus)", tax_table_temp$Species)
+tax_table(es.hsp_filtered) <- tax_table(as.matrix(tax_table_temp))
+
+# Create the bar plot with n_taxa = 2 for "Aliivibrio fischeri" and the "Vibrio" genus
+panel_1b.2 <- comp_barplot(es.hsp_filtered, "Species",
+  n_taxa = 2, # Only highlight 2 taxa
+  label = "FischeriLabel",
+  sample_order = panel_1b.1_order,
+  merge_other = TRUE, # Merge other taxa into "Other Species"
+  bar_width = 0.975,
+  palette = panel_1b.2_pal,
+  group_by = "treatment",
+  other_name = "Other Taxa",
+  tax_order = c("Aliivibrio fischeri", "Vibrio (Genus)")
+)
+
+# Wrap Plots
+panel_1b.2 <- patchwork::wrap_plots(panel_1b.2, ncol = 1, guides = "collect", scale = "free_x") &
+  labs(y = "Relative Abundance") &
+  scale_y_percent(limits = c(0, 1.05)) &
+  theme_biome_utils() &
+  theme(
+    legend.text = element_text(face = "italic", size = 9),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title.y = element_text(size = 9),
+    axis.title.x = element_text(size = 8),
+    strip.text = element_text(hjust = 0.5),
+    legend.key.width = unit(0.3, "cm"), 
+    legend.key.height = unit(0.3, "cm"),
+    plot.title = element_text(size = 10, hjust = 0, face = "bold"
+                              ),
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    panel.border = element_blank(),
+    legend.box.margin = margin(0, 2, 0, 0, "cm")
+  ) &
+  coord_flip()
+
+panel_1b.2 <- panel_1b.2 + plot_layout(heights = c(2, 3, 2, 2, 7), ncol = 1)
+```
+
+## Figure 2A
+```{r Figure 2A, echo=FALSE, eval=TRUE, cache=TRUE, fig.dim=c(10,10)}
+plot(panel_1b.2 + plot_layout(heights = c(2, 3, 2, 2, 7), ncol = 1)
+)
+```
+
+## Save *Vibrio fischeri* Relative Abundance Plot
+```{r Save Vibrio fischeri Relative Abundance Plot, echo=TRUE, eval=FALSE}
+pdf("panel_2.pdf", height = 6, width = 5)
+par(mar=c(9,5,1,2), cex=1)
+panel_1b.2 + plot_layout(heights = c(2, 3, 2, 2, 7), ncol = 1)
+dev.off()
+```
+
+## Define Fig 2B Sample Order
+```{r Define Fig 2.2 Sample Order, echo=TRUE, eval=FALSE, cache=TRUE}
+panel_4_order <- c("EsApoB", "EsApoA", "SymWtC", "SymWtB", "SymWtA", "SymES114B", "SymES114A", "SymES114VentA", "SymES114VentB", "MB212B", "MB212A", "MB211B", "MB211A", "MB15B", "MB15A", "MB13A")
+```
+
+## Create Palette for Figure 2A
+```{r Create Figure 2A TaxPalette, echo=TRUE, eval=TRUE, cache=TRUE}
+panel_4_pal <- c("Vibrionaceae" = "lightblue",
+                 "Bradyrhizobiaceae" = "#9c8bb3",
+                 "Methylobacteriaceae" = "#604f78",
+                 "Rhizobiaceae" = "darkseagreen2",
+                 "Rhodobacteraceae" = "darkseagreen3",
+                 "o__Rhodobacterales" = "darkseagreen4",
+                 "c__Proteobacteria" = "indianred1",
+                 "c__Alphaproteobacteria" = "indianred3",
+                 "Alteromonadaceae" = "lightgoldenrod1",
+                 "c__Gammaproteobacteria" = "lightgoldenrod3",
+                 "c__Actinomycetia" = "darkslategray4",
+                 "c__Actinobacteria" = "darkslategray",
+                 "Other Taxa" = "#d5bdaf",
+                 "Unidentified Bacteria" = "blanchedalmond")
+
+tax_palette_plot(panel_4_pal)
+```
+
+## Define Taxa Order for Figure 2A
+```{r Define Figure 2A Taxa Order, echo=TRUE, eval=FALSE, cache=TRUE}
+panel4_taxorder <- c("Vibrionaceae",
+                     "Bradyrhizobiaceae",
+                     "Methylobacteriaceae",
+                     "Rhizobiaceae",
+                     "Rhodobacteraceae",
+                     "o__Rhodobacterales",
+                     "c__Proteobacteria",
+                     "c__Alphaproteobacteria",
+                     "Alteromonadaceae",
+                     "c__Gammaproteobacteria",
+                     "c__Actinomycetia",
+                     "c__Actinobacteria",
+                     "Other Taxa",
+                     "Unidentified Bacteria")
+```
+
+## Calculate Percent Non-*Vibrio fischeri* Abundance in Squid
+```{r Percent Non-Vibrio fischeri, echo=TRUE, eval=FALSE, cache=TRUE}
+es.hsp.panel4 <- es.hsp.2
+
+# Extract the OTU and taxonomy tables
+otu_data <- otu_table(es.hsp.panel4)
+tax_data <- tax_table(es.hsp.panel4)
+
+# Identify which taxa belong to "Aliivibrio fischeri"
+nonfischeri_indices <- which(tax_data[, "Genus"] != "Aliivibrio")
+
+# Calulate the total abundance for each sample
+total_abundance <- colSums(otu_data)
+
+# Calculate the abundance of "fischeri" in each sample
+nonfischeri_abundance <- colSums(otu_data[nonfischeri_indices, ])
+
+# Calculate as a percentage
+nonfischeri_percentage <- (nonfischeri_abundance / total_abundance) * 100
+
+# Access the sample_data of the phyloseq object
+es.hsp.panel4.meta <- sample_data(es.hsp.panel4)
+
+# Add the fischeri_percentage as a new column
+es.hsp.panel4.meta$nonfischeri_percentage <- nonfischeri_percentage
+
+# Replace the sample_data in the phyloseq object with the modified sample_data
+sample_data(es.hsp.panel4) <- es.hsp.panel4.meta
+head(sample_data(es.hsp.panel4))
+
+# Extract the fischeri_percentage from the sample_data
+nonfischeri_percent_data <- sample_data(es.hsp.panel4)$nonfischeri_percentage
+
+# Create a new label in the es.hsp sample data that concatonates the sample name and the fischeri percentage (rather than trying to put the vibrio percentage on a different axis, much more complicated)
+new_labels <- paste(sample_names(es.hsp.panel4), sprintf(" (%.2f%%)", nonfischeri_percent_data))
+
+sample_data(es.hsp.panel4)$NonFischeriLabel <- paste(sample_data(es.hsp.panel4)$SAMPLE, new_labels)
+```
+
+## Plot Non-*Vibrio fischeri* Relative Abundance
+```{r Plot Non-Vf Relative Abundance, echo=TRUE, eval=FALSE, cache=TRUE}
+# Subset squid samples
+es.hsp.panel4 <- subset_samples(es.hsp.panel4, sample.type %in% c("juvenile squid", "juvenile squid ventate", "adult squid"))
+
+# Remove Aliivibrio fischeri taxa
+es.hsp.panel4 <- subset_taxa(es.hsp.panel4, Genus != "Aliivibrio")
+# also maybe remove Family != "Unassigned at"
+
+# Compositional transformation
+es.hsp.panel4 <- es.hsp.panel4 %>%
+  tax_transform("compositional", chain = TRUE)
+
+panel4 <- comp_barplot(es.hsp.panel4, "Family",
+  n_taxa = 13, # Only highlight 2 taxa
+  label = "NonFischeriLabel",
+  sample_order = panel_4_order,
+  merge_other = TRUE, # Merge other taxa into "Other Species"
+  bar_width = 0.975,
+  palette = panel_4_pal,
+  group_by = "treatment",
+  other_name = "Other Taxa",
+  tax_order = panel4_taxorder
+  #tax_order = c("Aliivibrio fischeri", "Vibrio (Genus)")
+)
+
+# Wrap Plots
+panel4 <- patchwork::wrap_plots(panel4, ncol = 1, guides = "collect", scale = "free_x") &
+  labs(y = "Relative Abundance") &
+  scale_y_percent(limits = c(0, 1.05)) &
+  theme_biome_utils() &
+  theme(
+    legend.text = element_text(face = "italic", size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title.y = element_text(size = 9),
+    axis.title.x = element_text(size = 8),
+    strip.text = element_text(hjust = 0.5),
+    legend.key.width = unit(0.3, "cm"), 
+    legend.key.height = unit(0.3, "cm"),
+    plot.title = element_text(size = 10, hjust = 0, face = "bold"),
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    panel.border = element_blank(),
+    legend.box.margin = margin(0, 2, 0, 0, "cm")
+  ) &
+  guides(fill = guide_legend(ncol = 3)) &
+  coord_flip()
+
+panel4 <- panel4 +
+  plot_layout(heights = c(2,3,2,2,7))
+```
+
+## Figure 2B
+```{r Figure 2B, echo=FALSE, eval=TRUE, fig.dim=c(10,10)}
+plot(panel4 + plot_layout(heights = c(2, 3, 2, 2, 7), ncol = 1)
+)
+```
+
+## Save Non-*Vibrio fischeri* Relative Abundance Plot
+```{r Save Non-Vf Relative Abundance Plot, echo=TRUE, eval=FALSE}
+pdf("panel_4.pdf", height = 7, width = 5)
+par(mar=c(9,5,1,2), cex=1)
+panel4 + plot_layout(heights = c(2, 3, 2, 2, 7), ncol = 1)
+dev.off()
+```
